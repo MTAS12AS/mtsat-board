@@ -21,6 +21,7 @@
     { id: 'calendar', th: 'ปฏิทิน' },
     { id: 'dashboard', th: 'ภาพรวม' },
     { id: 'team', th: 'ทีม' },
+    { id: 'meet', th: 'นัดประชุม', when: () => S.data.me.role !== 'Staff' },
     { id: 'admin', th: 'จัดการคน', when: () => S.data.me.isHR },
     { id: 'trash', th: 'ถังขยะ', when: () => S.data.me.role !== 'Staff' },
   ];
@@ -30,6 +31,7 @@
     filters: { unit: '', q: '', who: 'all', archived: false },
     calMonth: null, tableSort: { key: 'dueDate', dir: 1 },
     drawer: null, admin: null, adminQ: '', trash: null, pending: 0, pollTimer: null,
+    meet: null, cal: null,
   };
   const app = document.getElementById('app');
   const drawerRoot = document.getElementById('drawer-root');
@@ -301,7 +303,7 @@
     const main = document.getElementById('main');
     if (!main) return;
     const fn = { board: viewBoard, mine: viewMine, table: viewTable, calendar: viewCalendar, dashboard: viewDashboard,
-                 team: viewTeam, admin: viewAdmin, trash: viewTrash, profile: viewProfile }[S.view] || viewBoard;
+                 team: viewTeam, meet: viewMeet, admin: viewAdmin, trash: viewTrash, profile: viewProfile }[S.view] || viewBoard;
     main.innerHTML = fn();
     afterRender();
   }
@@ -644,7 +646,294 @@
           </form>
           <p class="sub">เบอร์โทรและ LINE จะแสดงให้เฉพาะ Board เห็น</p>
         </section>
+        ${profileCalendarHtml()}
       </div>`;
+  }
+
+  // ============================ นัดประชุม (Board) ============================
+
+  const DOW = ['อา.', 'จ.', 'อ.', 'พ.', 'พฤ.', 'ศ.', 'ส.'];
+  const DUR = [30, 60, 90, 120, 180];
+  const CAL_STATUS = {
+    OK: { th: 'เชื่อมแล้ว', cls: 'ok' },
+    NoAccess: { th: 'ยังไม่ได้แชร์ให้ระบบ', cls: 'wait' },
+    Error: { th: 'ตรวจไม่ได้', cls: 'bad' },
+    NoEmail: { th: 'ไม่มีอีเมล', cls: 'bad' },
+    Unchecked: { th: 'ยังไม่ได้ตรวจ', cls: 'wait' },
+  };
+  const addDays = (ymd, n) => new Date(Date.parse(ymd + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
+  const dowOf = ymd => DOW[new Date(ymd + 'T00:00:00Z').getUTCDay()];
+  const bkkMs = (ymd, min) => Date.parse(ymd + 'T00:00:00+07:00') + min * 60000;
+  const hhmm = min => String(Math.floor(min / 60)).padStart(2, '0') + ':' + String(min % 60).padStart(2, '0');
+  const bkkParts = iso => {
+    const d = new Date(new Date(iso).getTime() + 7 * 3600e3).toISOString();
+    return { ymd: d.slice(0, 10), min: Number(d.slice(11, 13)) * 60 + Number(d.slice(14, 16)) };
+  };
+  function meetState() {
+    if (!S.meet) S.meet = { from: todayYmd(), days: 7, startH: 9, endH: 22, dur: 60, sel: null, fb: null, loading: false, meetings: null, form: null };
+    return S.meet;
+  }
+  function calBadge(status, reason) {
+    const st = CAL_STATUS[status] || CAL_STATUS.Error;
+    return `<span class="cal-st ${st.cls}">${st.th}${status === 'Error' && reason ? ' (' + esc(reason) + ')' : ''}</span>`;
+  }
+  function calSetupHtml(central) {
+    return `<ol class="steps">
+      <li>เปิด <a href="https://calendar.google.com/calendar/r/settings" target="_blank" rel="noopener">การตั้งค่า Google Calendar</a> บนคอมพิวเตอร์ แล้วเลือกปฏิทินของคุณทางซ้าย (ใต้ “การตั้งค่าสำหรับปฏิทินของฉัน”)</li>
+      <li>หัวข้อ “แชร์กับบุคคลหรือกลุ่มที่เฉพาะเจาะจง” (Share with specific people) กด “เพิ่มบุคคล” แล้วใส่ <b class="mono">${esc(central || 'บัญชีกลางของระบบ')}</b></li>
+      <li>สิทธิ์เลือก <b>“ดูเฉพาะว่าง/ไม่ว่าง (ซ่อนรายละเอียด)”</b> แล้วกดส่ง — ระบบจะเห็นแค่ช่วงที่ไม่ว่าง ไม่เห็นชื่อนัด</li>
+      <li>กลับมากด “ตรวจสอบการเชื่อม”</li>
+    </ol>
+    <p class="sub">ถ้าแชร์จากบัญชีมหาวิทยาลัยไม่ได้ (บางมหาวิทยาลัยปิดการแชร์ออกนอกโดเมน) ให้แชร์จากปฏิทิน Gmail ส่วนตัว แล้วใส่อีเมลนั้นในช่อง “อีเมลปฏิทิน”</p>`;
+  }
+
+  async function loadMeet(force) {
+    const M = meetState();
+    try {
+      if (!S.cal || force) S.cal = (await api('calendar.people')).data;
+      if (!M.meetings || force) M.meetings = (await api('meeting.list')).data.meetings;
+      if (!M.fb || force) {
+        M.loading = true;
+        const fb = (await api('calendar.freebusy', { from: M.from, days: M.days })).data;
+        M.fb = fb;
+        if (!M.sel) M.sel = new Set(fb.people.filter(p => p.status === 'OK').map(p => p.personId));
+      }
+      M.err = '';
+    } catch (e) { fail(e); M.err = e.message || 'โหลดไม่สำเร็จ'; }
+    M.loading = false;
+    if (S.view === 'meet') renderMain();
+  }
+
+  /** คำนวณช่องว่างจาก busy ของคนที่เลือก (เฉพาะคนที่เชื่อมปฏิทินแล้ว) */
+  function meetCalc() {
+    const M = S.meet, fb = M.fb;
+    const sel = fb.people.filter(p => M.sel.has(p.personId));
+    const known = sel.filter(p => p.status === 'OK');
+    const unknown = sel.filter(p => p.status !== 'OK');
+    const busy = {};
+    known.forEach(p => { busy[p.personId] = p.busy.map(b => [Date.parse(b[0]), Date.parse(b[1])]); });
+    const busyAt = (s, e) => known.filter(p => busy[p.personId].some(b => b[0] < e && b[1] > s)).map(p => p.personId);
+    const days = [];
+    for (let i = 0; i < fb.days; i++) days.push(addDays(fb.from, i));
+    const lo = M.startH * 60, hi = M.endH * 60, now = Date.now();
+    // ช่อง 30 นาทีสำหรับตาราง
+    const cells = days.map(day => {
+      const col = [];
+      for (let m = lo; m + 30 <= hi; m += 30) {
+        const s = bkkMs(day, m), e = s + 30 * 60000;
+        col.push({ day, min: m, past: e <= now, busy: busyAt(s, e) });
+      }
+      return col;
+    });
+    // เวลาเริ่มที่ใช้ได้ตามความยาวประชุม
+    const cands = [];
+    days.forEach(day => {
+      for (let m = lo; m + M.dur <= hi; m += 30) {
+        const s = bkkMs(day, m);
+        if (s < now) continue;
+        const b = busyAt(s, s + M.dur * 60000);
+        cands.push({ day, min: m, busy: b, free: known.length - b.length });
+      }
+    });
+    let best = -1;
+    cands.forEach(c => { best = Math.max(best, c.free); });
+    const ranges = [];
+    cands.filter(c => c.free === best).forEach(c => {
+      const last = ranges[ranges.length - 1];
+      if (last && last.day === c.day && last.lastMin + 30 === c.min && last.busy.join() === c.busy.join()) last.lastMin = c.min;
+      else ranges.push({ day: c.day, min: c.min, lastMin: c.min, busy: c.busy });
+    });
+    return { sel, known, unknown, days, cells, ranges, best, busyAt };
+  }
+
+  function viewMeet() {
+    const M = meetState();
+    if (!M.fb || !S.cal || !M.meetings) {
+      if (!M.loading && !M.err) { M.loading = true; loadMeet(false); }
+      return `<div class="page-head"><div><h1>นัดประชุม Board</h1></div>${M.err ? '<button class="btn" data-act="meet-reload">ลองอีกครั้ง</button>' : ''}</div>
+        <div class="list"><div class="empty">${M.err ? esc(M.err) : 'กำลังดึงปฏิทิน…'}</div></div>`;
+    }
+    const d = S.data, fb = M.fb, C = meetCalc();
+    const meId = d.me.personId;
+    const mine = fb.people.find(p => p.personId === meId);
+    const nameOf = id => { const p = (S.cal.people.find(x => x.personId === id) || {}); return p.nickname || p.name || personName(id); };
+    const hours = [];
+    for (let h = 0; h <= 24; h++) hours.push(h);
+
+    const banner = mine && mine.status !== 'OK' ? `<section class="panel wide calwarn"><h2>ปฏิทินของคุณยังไม่ได้เชื่อม ${calBadge(mine.status, mine.reason)}</h2>
+      <p class="sub">คนอื่นจะเห็นว่าคุณ “ไม่ทราบสถานะ” จนกว่าจะแชร์ปฏิทิน (${esc(mine.calendarId || 'ไม่มีอีเมล')})</p>${calSetupHtml(fb.central)}
+      <div class="acts"><a class="btn small" href="#/profile">ตั้งค่าอีเมลปฏิทิน / ตรวจสอบการเชื่อม</a></div></section>` : '';
+
+    const chips = fb.people.slice().sort((a, b) => nameOf(a.personId).localeCompare(nameOf(b.personId), 'th')).map(p => {
+      const on = M.sel.has(p.personId), st = CAL_STATUS[p.status] || CAL_STATUS.Error;
+      return `<button type="button" class="pchip${on ? ' on' : ''}" data-act="meet-toggle" data-id="${esc(p.personId)}" aria-pressed="${on}"
+        title="${esc(personFull(p.personId))} · ${esc(p.calendarId)} · ${esc(st.th)}"><i class="dot ${st.cls}"></i>${esc(nameOf(p.personId))}${p.personId === meId ? ' (ฉัน)' : ''}</button>`;
+    }).join('');
+
+    const controls = `<div class="meet-controls">
+      <label class="field">เริ่มดูวันที่<input type="date" data-meet="from" value="${esc(M.from)}" min="${todayYmd()}"></label>
+      <label class="field">ดูกี่วัน<select data-meet="days">${[3, 7, 14].map(n => `<option value="${n}" ${M.days === n ? 'selected' : ''}>${n} วัน</option>`).join('')}</select></label>
+      <label class="field span2">ช่วงเวลา
+        <span class="row-inline"><select data-meet="startH" aria-label="ตั้งแต่">${hours.slice(0, 24).map(h => `<option value="${h}" ${M.startH === h ? 'selected' : ''}>${hhmm(h * 60)}</option>`).join('')}</select>
+        <select data-meet="endH" aria-label="ถึง">${hours.slice(1).map(h => `<option value="${h}" ${M.endH === h ? 'selected' : ''}>${hhmm(h * 60)}</option>`).join('')}</select></span></label>
+      <label class="field">ประชุมนาน<select data-meet="dur">${DUR.map(n => `<option value="${n}" ${M.dur === n ? 'selected' : ''}>${n < 60 ? n + ' นาที' : n / 60 + ' ชม.'}</option>`).join('')}</select></label>
+      <div class="acts presets"><span class="sub">ด่วน:</span>
+        <button class="btn small" data-act="meet-preset" data-s="9" data-e="22">ทั้งวัน 09–22</button>
+        <button class="btn small" data-act="meet-preset" data-s="9" data-e="17">กลางวัน 09–17</button>
+        <button class="btn small" data-act="meet-preset" data-s="18" data-e="22">ค่ำ 18–22</button></div>
+    </div>`;
+
+    let sugg;
+    if (!C.known.length) sugg = '<div class="empty">เลือกคนที่เชื่อมปฏิทินแล้วอย่างน้อย 1 คน ระบบจึงจะหาเวลาว่างได้</div>';
+    else if (!C.ranges.length) sugg = '<div class="empty">ไม่มีช่วงที่ยาวพอในวันและเวลาที่เลือก ลองขยายช่วงเวลาหรือเพิ่มจำนวนวัน</div>';
+    else {
+      const all = C.best === C.known.length;
+      sugg = `<p class="sub">${all ? `ช่วงที่ทุกคนที่เลือกว่าง (${C.known.length} คน)` : `ไม่มีช่วงที่ทุกคนว่าง — ช่วงที่ว่างมากที่สุด ${C.best}/${C.known.length} คน`}
+        ${C.unknown.length ? ` · ไม่ทราบสถานะ ${C.unknown.length} คน (${C.unknown.map(p => esc(nameOf(p.personId))).join(', ')})` : ''}</p>
+        <div class="sugg">${C.ranges.slice(0, 10).map(r => `<div class="sg">
+          <div><b>${dowOf(r.day)} ${esc(dateTh(r.day))}</b> · ${hhmm(r.min)}–${hhmm(r.lastMin + M.dur)} น.
+            ${r.lastMin > r.min ? `<div class="sub">เริ่มได้ระหว่าง ${hhmm(r.min)}–${hhmm(r.lastMin)} น.</div>` : ''}
+            ${r.busy.length ? `<div class="sub">ไม่ว่าง: ${r.busy.map(id => esc(nameOf(id))).join(', ')}</div>` : ''}</div>
+          <button class="btn small primary" data-act="meet-slot" data-day="${r.day}" data-min="${r.min}">นัดเวลานี้</button></div>`).join('')}
+          ${C.ranges.length > 10 ? `<div class="sub">และอีก ${C.ranges.length - 10} ช่วง ดูได้ในตารางด้านล่าง</div>` : ''}</div>`;
+    }
+
+    const rows = C.cells.length ? C.cells[0].map((_, i) => {
+      const m = C.cells[0][i].min;
+      return `<tr><th scope="row" class="tm">${m % 60 === 0 ? hhmm(m) : ''}</th>${C.cells.map(col => {
+        const c = col[i];
+        const free = C.known.length - c.busy.length;
+        const lvl = C.known.length ? Math.round((4 * free) / C.known.length) : -1;
+        const tip = c.past ? 'ผ่านไปแล้ว' : C.known.length ? `${hhmm(c.min)} ว่าง ${free}/${C.known.length}${c.busy.length ? ' · ไม่ว่าง: ' + c.busy.map(nameOf).join(', ') : ''}` : '';
+        return `<td><button type="button" class="hm${c.past ? ' past' : ' l' + lvl}" ${c.past ? 'disabled' : `data-act="meet-slot" data-day="${c.day}" data-min="${c.min}"`}
+          title="${esc(tip)}" aria-label="${esc(dowOf(c.day) + ' ' + dateTh(c.day) + ' ' + tip)}">${!c.past && free > 0 && free < C.known.length ? free : ''}</button></td>`;
+      }).join('')}</tr>`;
+    }).join('') : '';
+    const grid = `<div class="hm-wrap"><table class="hmap"><thead><tr><th></th>${C.days.map(day => `<th scope="col"><span>${dowOf(day)}</span> ${esc(dateTh(day))}</th>`).join('')}</tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      <div class="legend hm-legend"><span><i class="hm l4"></i> ทุกคนว่าง</span><span><i class="hm l2"></i> ว่างบางคน (ตัวเลข = จำนวนคนว่าง)</span><span><i class="hm l0"></i> ไม่มีใครว่าง</span><span class="sub">กดช่องเพื่อนัดเวลานั้น</span></div>`;
+
+    const meetings = M.meetings.map(m => {
+      const s = bkkParts(m.start), e = bkkParts(m.end);
+      return `<div class="item mt"><div class="when"><b>${dowOf(s.ymd)} ${esc(dateTh(s.ymd))}</b><span>${hhmm(s.min)}–${hhmm(e.min)} น.</span></div>
+        <span class="main"><span class="t">${esc(m.title)}</span><span class="meta">${m.location ? `<span>${esc(m.location)}</span>` : ''}
+          <span>${m.attendeeIds.length} คน: ${m.attendeeIds.map(id => esc(nameOf(id))).join(', ')}</span><span>นัดโดย ${esc(m.createdByName)}</span></span></span>
+        <span class="acts">${m.meetLink ? `<a class="btn small primary" href="${esc(m.meetLink)}" target="_blank" rel="noopener">เข้า Meet</a>` : ''}
+          ${m.htmlLink ? `<a class="btn small" href="${esc(m.htmlLink)}" target="_blank" rel="noopener">ปฏิทิน</a>` : ''}
+          ${m.canCancel ? `<button class="btn small danger" data-act="meet-cancel" data-id="${esc(m.id)}">ยกเลิกนัด</button>` : ''}</span></div>`;
+    }).join('') || '<div class="empty">ยังไม่มีนัดที่สร้างจากระบบ</div>';
+
+    return `<div class="page-head"><div><h1>นัดประชุม Board</h1>
+        <p>ดูช่วงว่างของ Board จาก Google Calendar (เห็นแค่ว่าง/ไม่ว่าง ไม่เห็นรายละเอียดนัด) แล้วสร้างนัดพร้อมส่งคำเชิญ</p></div>
+        <button class="btn" data-act="meet-reload">ดึงปฏิทินใหม่</button></div>
+      <div class="dash">
+        ${banner}
+        ${M.form ? meetFormHtml(C, nameOf) : ''}
+        <section class="panel wide"><h2>ใครเข้าประชุม <span class="sub">${M.sel.size}/${fb.people.length} คน</span></h2>
+          <div class="pchips">${chips}</div>
+          <div class="acts" style="margin-top:10px"><button class="btn small" data-act="meet-all">เลือกทุกคนที่เชื่อมแล้ว</button>
+            <button class="btn small" data-act="meet-none">ล้าง</button>
+            <span class="legend"><span><i class="dot ok"></i> เชื่อมปฏิทินแล้ว</span><span><i class="dot wait"></i> ยังไม่แชร์ปฏิทิน (ไม่นับในการหาเวลา)</span></span></div>
+          ${controls}
+        </section>
+        <section class="panel wide"><h2>เวลาที่แนะนำ</h2>${sugg}</section>
+        <section class="panel wide"><h2>ตารางว่าง <span class="sub">${esc(dateTh(C.days[0]))} – ${esc(dateTh(C.days[C.days.length - 1]))} · ${hhmm(M.startH * 60)}–${hhmm(M.endH * 60)} น.</span></h2>${grid}</section>
+        <section class="panel wide"><h2>นัดที่จะถึง</h2><div class="list">${meetings}</div></section>
+      </div>`;
+  }
+
+  function meetFormHtml(C, nameOf) {
+    const F = S.meet.form, me = S.data.me.personId;
+    const others = S.meet.fb.people.filter(p => F.ids.indexOf(p.personId) === -1);
+    return `<section class="panel wide meet-form" id="meet-form"><h2>สร้างนัดประชุม</h2>
+      <form data-form="meeting" class="fields">
+        <label class="field full">หัวข้อประชุม<input type="text" data-mf="title" value="${esc(F.title)}" maxlength="200" required placeholder="เช่น ประชุม Board ครั้งที่ 3"></label>
+        <label class="field">วันที่<input type="date" data-mf="day" value="${esc(F.day)}" min="${todayYmd()}" required></label>
+        <span class="row-inline">
+          <label class="field">เริ่ม<input type="time" data-mf="time" value="${hhmm(F.min)}" step="900" required></label>
+          <label class="field">นาน<select data-mf="dur">${DUR.map(n => `<option value="${n}" ${F.dur === n ? 'selected' : ''}>${n < 60 ? n + ' นาที' : n / 60 + ' ชม.'}</option>`).join('')}</select></label>
+        </span>
+        <label class="field">สถานที่ (ถ้ามี)<input type="text" data-mf="location" value="${esc(F.location)}" maxlength="200"></label>
+        <label class="check" style="align-self:end"><input type="checkbox" data-mf="withMeet" ${F.withMeet ? 'checked' : ''}> แนบลิงก์ Google Meet</label>
+        <label class="field full">วาระ / รายละเอียด<textarea data-mf="description" maxlength="5000">${esc(F.description)}</textarea></label>
+        <div class="field full">ผู้เข้าประชุม (${F.ids.length} คน)
+          <div class="tags">${F.ids.map(id => `<span class="tag">${esc(nameOf(id))}${id === me ? ' (ฉัน)' : `<button type="button" data-act="mf-remove" data-id="${esc(id)}" aria-label="เอาออก">×</button>`}</span>`).join('')}
+            ${others.length ? `<select data-mf-add aria-label="เพิ่มผู้เข้าประชุม" style="width:auto;padding:3px 8px;font-size:13.5px"><option value="">+ เพิ่มคน</option>
+              ${others.map(p => `<option value="${esc(p.personId)}">${esc(nameOf(p.personId))}</option>`).join('')}</select>` : ''}</div></div>
+        <div class="full" id="mf-conflict">${meetConflictHtml(nameOf)}</div>
+        <div class="full acts"><button class="btn primary" type="submit">สร้างนัดและส่งคำเชิญ</button>
+          <button class="btn" type="button" data-act="mf-close">ยกเลิก</button>
+          <span class="sub">คำเชิญส่งจากปฏิทินบัญชีกลางไปที่อีเมลปฏิทินของแต่ละคน</span></div>
+      </form></section>`;
+  }
+
+  function meetConflictHtml(nameOf) {
+    const F = S.meet.form, fb = S.meet.fb;
+    nameOf = nameOf || (id => personName(id));
+    if (!F.day || F.min == null || isNaN(F.min)) return '';
+    const s = bkkMs(F.day, F.min), e = s + F.dur * 60000;
+    if (s < Date.now()) return '<div class="warnbox">เวลาที่เลือกผ่านไปแล้ว</div>';
+    const inRange = F.day >= fb.from && F.day < addDays(fb.from, fb.days);
+    const people = fb.people.filter(p => F.ids.indexOf(p.personId) !== -1);
+    if (!inRange) return '<p class="sub">วันนี้อยู่นอกช่วงที่ดึงปฏิทินไว้ จึงยังตรวจว่าใครว่างไม่ได้</p>';
+    const busy = people.filter(p => p.status === 'OK' && p.busy.some(b => Date.parse(b[0]) < e && Date.parse(b[1]) > s));
+    const unknown = people.filter(p => p.status !== 'OK');
+    return `${busy.length ? `<div class="warnbox">ไม่ว่างช่วงนี้: ${busy.map(p => esc(nameOf(p.personId))).join(', ')}</div>` : '<div class="okbox">ทุกคนที่เชื่อมปฏิทินว่างช่วงนี้</div>'}
+      ${unknown.length ? `<p class="sub">ไม่ทราบสถานะ: ${unknown.map(p => esc(nameOf(p.personId))).join(', ')}</p>` : ''}`;
+  }
+
+  function openMeetForm(day, min) {
+    const M = S.meet, me = S.data.me.personId;
+    const ids = [me].concat(Array.from(M.sel).filter(id => id !== me));
+    M.form = Object.assign({ title: '', description: '', location: '', withMeet: true }, M.form || {}, { day, min, dur: M.dur, ids: M.form ? M.form.ids : ids });
+    renderMain();
+    const f = document.getElementById('meet-form');
+    if (f) { f.scrollIntoView({ behavior: 'smooth', block: 'start' }); const t = f.querySelector('[data-mf=title]'); if (t) t.focus({ preventScroll: true }); }
+  }
+
+  function refreshConflict() {
+    const box = document.getElementById('mf-conflict');
+    if (box) box.innerHTML = meetConflictHtml();
+  }
+
+  async function submitMeeting() {
+    const F = S.meet.form, me = S.data.me.personId;
+    if (!F.title.trim()) { toast('กรุณาใส่หัวข้อประชุม', 'err'); return; }
+    const s = bkkMs(F.day, F.min), e = s + F.dur * 60000;
+    const iso = ms => { const d = new Date(ms + 7 * 3600e3).toISOString(); return d.slice(0, 19) + '+07:00'; };
+    try {
+      const j = await api('meeting.create', { title: F.title, description: F.description, location: F.location, withMeet: F.withMeet,
+                                              start: iso(s), end: iso(e), attendeeIds: F.ids.filter(id => id !== me) }, true);
+      toast('สร้างนัดแล้ว ส่งคำเชิญ ' + j.data.invited + ' อีเมล');
+      if (j.data.warning) toast(j.data.warning, 'warn');
+      S.meet.form = null;
+      S.meet.fb = null;
+      S.meet.meetings = null;
+      renderMain();
+    } catch (err) { fail(err); }
+  }
+
+  // ---------- ส่วนปฏิทินในหน้าโปรไฟล์ ----------
+  function profileCalendarHtml() {
+    if (!isBoard()) return '';
+    if (!S.cal) {
+      if (!S.calLoading) {
+        S.calLoading = true;
+        api('calendar.people').then(j => { S.cal = j.data; }).catch(e => { S.calErr = e.message; })
+          .finally(() => { S.calLoading = false; if (S.view === 'profile') renderMain(); });
+      }
+      return `<section class="panel wide"><h2>ปฏิทิน Google สำหรับนัดประชุม</h2><div class="empty">${S.calErr ? esc(S.calErr) : 'กำลังโหลด…'}</div></section>`;
+    }
+    const c = S.cal.me;
+    return `<section class="panel wide"><h2>ปฏิทิน Google สำหรับนัดประชุม ${calBadge(c.status, c.reason)}</h2>
+      <p class="sub">Board เห็นช่วงว่าง/ไม่ว่างของกันและกันในหน้า “นัดประชุม” ${c.lastCheckedAt ? '· ตรวจล่าสุด ' + esc(dateTimeTh(c.lastCheckedAt)) : ''}</p>
+      ${c.status === 'OK' ? '' : calSetupHtml(S.cal.central)}
+      <form class="row-inline cal-form" data-form="calcheck">
+        <label class="field">อีเมลปฏิทิน (เว้นว่าง = ใช้อีเมลหลัก)
+          <input type="email" name="calendarId" value="${esc(c.custom ? c.calendarId : '')}" placeholder="${esc(c.calendarId)}" list="my-emails"></label>
+        <datalist id="my-emails">${(c.emails || []).map(e => `<option value="${esc(e)}">`).join('')}</datalist>
+        <button class="btn primary" type="submit">ตรวจสอบการเชื่อม</button>
+      </form></section>`;
   }
 
   // ============================ ถังขยะ ============================
@@ -1108,6 +1397,28 @@
       }
       case 'email-remove': if (confirm('ลบอีเมล ' + el.dataset.e + '?')) adminAction('email.remove', { personId: el.dataset.p, email: el.dataset.e }, 'ลบอีเมลแล้ว'); break;
       case 'mem-end': if (confirm('ให้คนนี้ออกจากตำแหน่งนี้?')) adminAction('membership.end', { membershipId: el.dataset.id }, 'ออกจากตำแหน่งแล้ว'); break;
+      case 'meet-toggle': {
+        const M = S.meet, id = el.dataset.id;
+        if (M.sel.has(id)) M.sel.delete(id); else M.sel.add(id);
+        renderMain(); break;
+      }
+      case 'meet-all': S.meet.sel = new Set(S.meet.fb.people.filter(p => p.status === 'OK').map(p => p.personId)); renderMain(); break;
+      case 'meet-none': S.meet.sel = new Set(); renderMain(); break;
+      case 'meet-preset': S.meet.startH = Number(el.dataset.s); S.meet.endH = Number(el.dataset.e); renderMain(); break;
+      case 'meet-reload': S.meet.fb = null; S.meet.meetings = null; S.cal = null; S.meet.err = ''; renderMain(); break;
+      case 'meet-slot': openMeetForm(el.dataset.day, Number(el.dataset.min)); break;
+      case 'mf-close': S.meet.form = null; renderMain(); break;
+      case 'mf-remove': S.meet.form.ids = S.meet.form.ids.filter(x => x !== el.dataset.id); renderMain(); break;
+      case 'meet-cancel': {
+        const m = S.meet.meetings.find(x => x.id === el.dataset.id);
+        if (!m || !confirm('ยกเลิกนัด “' + m.title + '”? ระบบจะแจ้งผู้ได้รับเชิญทุกคน')) break;
+        try {
+          await api('meeting.cancel', { meetingId: m.id }, true);
+          toast('ยกเลิกนัดแล้ว');
+          S.meet.meetings = null; S.meet.fb = null; renderMain();
+        } catch (err) { fail(err); }
+        break;
+      }
       case 'person-active': adminAction('person.save', { personId: el.dataset.id, active: el.dataset.on === '1' }, el.dataset.on === '1' ? 'เปิดบัญชีแล้ว' : 'ปิดบัญชีแล้ว'); break;
       default: break;
     }
@@ -1115,6 +1426,15 @@
 
   document.addEventListener('input', e => {
     const el = e.target;
+    if (el.dataset.mf && S.meet && S.meet.form) {
+      const F = S.meet.form, k = el.dataset.mf;
+      if (k === 'withMeet') F.withMeet = el.checked;
+      else if (k === 'time') { const t = /^(\d{2}):(\d{2})/.exec(el.value); if (t) F.min = Number(t[1]) * 60 + Number(t[2]); refreshConflict(); }
+      else if (k === 'dur') { F.dur = Number(el.value); refreshConflict(); }
+      else if (k === 'day') { F.day = el.value; refreshConflict(); }
+      else F[k] = el.value;
+      return;
+    }
     if (el.dataset.filter === 'q') { S.filters.q = el.value; renderBody(); return; }
     if (el.hasAttribute('data-admin-q')) {
       S.adminQ = el.value;
@@ -1137,6 +1457,24 @@
 
   document.addEventListener('change', e => {
     const el = e.target;
+    if (el.dataset.meet && S.meet) {
+      const M = S.meet, k = el.dataset.meet;
+      if (k === 'from') { if (!el.value) return; M.from = el.value; M.fb = null; }
+      else M[k] = Number(el.value);
+      if (k === 'days') M.fb = null;
+      if (k === 'startH' && M.endH <= M.startH) M.endH = Math.min(24, M.startH + 1);
+      if (k === 'endH' && M.startH >= M.endH) M.startH = Math.max(0, M.endH - 1);
+      renderMain(); return;
+    }
+    if (el.dataset.mf && S.meet && S.meet.form) {
+      const F = S.meet.form, k = el.dataset.mf;
+      if (k === 'withMeet') F.withMeet = el.checked;
+      if (k === 'dur') { F.dur = Number(el.value); refreshConflict(); }
+      return;
+    }
+    if (el.hasAttribute('data-mf-add') && el.value && S.meet && S.meet.form) {
+      S.meet.form.ids.push(el.value); renderMain(); return;
+    }
     const f = el.dataset.filter;
     if (f === 'unit' || f === 'who') { S.filters[f] = el.value; renderBody(); return; }
     if (f === 'archived') { S.filters.archived = el.checked; renderBody(); return; }
@@ -1187,6 +1525,20 @@
         renderShell();
       } catch (err) { fail(err); }
     }
+    if (form.dataset.form === 'meeting') { await submitMeeting(); return; }
+    if (form.dataset.form === 'calcheck') {
+      try {
+        const j = await api('calendar.check', { calendarId: String(fd.get('calendarId') || '').trim() }, true);
+        const r = j.data;
+        if (r.status === 'OK') toast('เชื่อมปฏิทินแล้ว (' + r.calendarId + ')');
+        else if (r.status === 'NoAccess') toast('ระบบยังมองไม่เห็นปฏิทิน ' + r.calendarId + ' — แชร์ให้ ' + r.central + ' แบบดูเฉพาะว่าง/ไม่ว่างก่อน', 'warn');
+        else toast('ตรวจปฏิทินไม่ได้: ' + r.reason, 'err');
+        S.cal = (await api('calendar.people')).data;
+        if (S.meet) S.meet.fb = null;
+        renderMain();
+      } catch (err) { fail(err); }
+      return;
+    }
     if (form.dataset.form === 'add-person') {
       try {
         const j = await api('person.save', { displayName: fd.get('displayName'), nickname: fd.get('nickname'), email: fd.get('email') }, true);
@@ -1234,7 +1586,7 @@
       if (j.data.version === S.version) return;
       await refresh();
       if (['board', 'table', 'calendar'].indexOf(S.view) !== -1) renderBody();
-      else if (S.view !== 'admin' && S.view !== 'profile') renderMain();
+      else if (['admin', 'profile', 'meet'].indexOf(S.view) === -1) renderMain();
       if (S.drawer && S.drawer.mode === 'view' && !S.drawer.dirty) {
         if (!S.data.taskById[S.drawer.id]) { toast('งานนี้ถูกลบหรือคุณไม่มีสิทธิ์เห็นแล้ว', 'warn'); closeDrawer(true); }
         else loadDetail(S.drawer.id);
